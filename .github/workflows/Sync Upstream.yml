@@ -1,0 +1,70 @@
+name: Sync Upstream
+
+# 定时把上游 OpenListTeam/OpenList-Worker 的 main 强制镜像到本仓库
+# 注意：cron 使用 UTC 时间，0 16 * * * = 北京时间每天 0 点
+on:
+  schedule:
+    - cron: '0 16 * * *'
+  workflow_dispatch: # 允许在 Actions 页面手动触发
+
+permissions:
+  contents: write # 推送提交到 origin/main 所需；permissions 里没有 workflows 这个 scope
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: true
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          # 如果某次同步的提交里包含 .github/workflows/ 下的改动（新增/修改/删除），
+          # 默认的 GITHUB_TOKEN 会被 GitHub 服务端拒绝，报：
+          #   refusing to allow a GitHub App to create or update workflow
+          #   `.github/workflows/xxx.yml` without `workflows` permission
+          # 这个限制无法通过 permissions: 解除，只能换成带 workflow scope 的 PAT。
+          # 配好 secret SYNC_TOKEN 后自动生效；没配则回退到默认 token。
+          token: ${{ secrets.SYNC_TOKEN || github.token }}
+
+      - name: Git config
+        run: |
+          git config user.name "isbwc"
+          git config user.email "isedubw@gmail.com"
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream https://github.com/OpenListTeam/OpenList-Worker.git
+          git fetch upstream main --tags --force --prune --prune-tags
+
+      - name: Mirror main and push
+        run: |
+          git reset --hard upstream/main
+
+          # 备份你自己的工作流文件（上游没有的那些），稍后恢复
+          mkdir -p /tmp/keep-workflows
+          git ls-tree -r --name-only origin/main -- .github/workflows | while read -r f; do
+            if ! git cat-file -e "upstream/main:$f" 2>/dev/null; then
+              mkdir -p "/tmp/keep-workflows/$(dirname "$f")"
+              git show "origin/main:$f" > "/tmp/keep-workflows/$f"
+            fi
+          done
+
+          # 清掉上游自带的 CI 工作流（避免它们在你的仓库运行、自动提交），再恢复你自己的
+          rm -rf .github/workflows
+          cp -a /tmp/keep-workflows/.github . 2>/dev/null || true
+
+          git add -A
+          git push origin --tags --force
+
+          # 与上次推送状态比较，无变化就不提交
+          if git diff --cached --quiet origin/main; then
+            echo "已是最新，无需同步"
+          else
+            git commit -m "chore: sync upstream $(git rev-parse --short upstream/main)"
+            git push --force origin main
+          fi
